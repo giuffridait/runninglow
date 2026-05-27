@@ -3,11 +3,13 @@ import { cookies } from "next/headers";
 export const AUTH_STATE_COOKIE = "google_oauth_state";
 export const GMAIL_CONNECTION_COOKIE = "gmail_connected";
 
-type GmailConnection = {
+export type GmailConnection = {
   provider: "google";
   scope: string;
   expiresAt: string;
   connectedAt: string;
+  accessToken?: string;
+  refreshToken?: string;
 };
 
 export async function setOAuthState(state: string) {
