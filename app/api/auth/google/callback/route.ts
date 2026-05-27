@@ -37,8 +37,6 @@ export async function GET(request: Request) {
       scope: tokens.scope,
       expiresAt,
       connectedAt: new Date().toISOString(),
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
     });
     await clearOAuthState();
 

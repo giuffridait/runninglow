@@ -8,8 +8,6 @@ export type GmailConnection = {
   scope: string;
   expiresAt: string;
   connectedAt: string;
-  accessToken?: string;
-  refreshToken?: string;
 };
 
 export async function setOAuthState(state: string) {
