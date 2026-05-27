@@ -57,3 +57,30 @@ export async function exchangeGoogleCode(params: {
 }
 
 export const GMAIL_SCOPE = GMAIL_READONLY_SCOPE;
+
+
+export async function refreshGoogleAccessToken(params: {
+  refreshToken: string;
+  clientId: string;
+  clientSecret: string;
+}) {
+  const body = new URLSearchParams({
+    refresh_token: params.refreshToken,
+    client_id: params.clientId,
+    client_secret: params.clientSecret,
+    grant_type: "refresh_token",
+  });
+
+  const response = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Google token refresh failed: ${response.status} ${text}`);
+  }
+
+  return (await response.json()) as GoogleTokenResponse;
+}

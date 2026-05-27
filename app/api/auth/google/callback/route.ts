@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { exchangeGoogleCode } from "@/lib/auth/google";
 import { clearOAuthState, getOAuthState, setGmailConnection } from "@/lib/auth/session";
 import { env } from "@/lib/env";
+import { upsertGoogleOAuthConnection } from "@/lib/auth/oauth-connection";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -31,6 +32,13 @@ export async function GET(request: Request) {
     });
 
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000).toISOString();
+
+    await upsertGoogleOAuthConnection({
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      expiresAt,
+      scope: tokens.scope,
+    });
 
     await setGmailConnection({
       provider: "google",
