@@ -4,8 +4,17 @@ import { extractHeader, getGmailMessageMetadata, listGmailMessages } from "@/lib
 import { getGoogleOAuthConnection, upsertGoogleOAuthConnection } from "@/lib/auth/oauth-connection";
 import { env } from "@/lib/env";
 import { refreshGoogleAccessToken } from "@/lib/auth/google";
+import { parseKnusprEmail } from "@/lib/parsers/knuspr";
 
 const USER_ID = "00000000-0000-0000-0000-000000000001";
+
+function inferMerchant(fromAddress: string | null) {
+  if (!fromAddress) return null;
+  const f = fromAddress.toLowerCase();
+  if (f.includes("knuspr")) return "knuspr";
+  if (f.includes("zooplus")) return "zooplus";
+  return null;
+}
 
 export async function POST() {
   const supabase = createSupabaseServerClient();
@@ -34,6 +43,7 @@ export async function POST() {
   let pageToken: string | undefined;
   let fetched = 0;
   let upserted = 0;
+  let parsedOrders = 0;
 
   try {
     do {
@@ -61,6 +71,8 @@ export async function POST() {
         const subject = extractHeader(metadata, "subject") ?? null;
         const fromAddress = extractHeader(metadata, "from") ?? null;
         const receivedAt = metadata.internalDate ? new Date(Number(metadata.internalDate)).toISOString() : null;
+        const merchant = inferMerchant(fromAddress);
+
         const { error } = await supabase.from("source_email").upsert({
           user_id: USER_ID,
           gmail_message_id: metadata.id,
@@ -69,15 +81,38 @@ export async function POST() {
           subject,
           from_address: fromAddress,
           parse_status: "pending",
+          raw_html: null,
         }, { onConflict: "user_id,gmail_message_id" });
         if (!error) upserted += 1;
+
+        if (merchant === "knuspr" && subject) {
+          const parsed = parseKnusprEmail(subject);
+          const { data: order, error: orderError } = await supabase
+            .from("order")
+            .insert({
+              user_id: USER_ID,
+              merchant_id: 1,
+              source_email_id: null,
+              order_external_id: parsed.order_external_id,
+              order_date: parsed.order_date,
+              currency: parsed.currency,
+              total_price: parsed.total_price,
+            })
+            .select("id")
+            .single();
+
+          if (!orderError && order) {
+            parsedOrders += 1;
+            await supabase.from("source_email").update({ parse_status: "parsed", parse_error: null }).eq("user_id", USER_ID).eq("gmail_message_id", metadata.id);
+          }
+        }
       }
 
       pageToken = page.nextPageToken;
     } while (pageToken);
 
-    await supabase.from("ingest_job").update({ status: "succeeded", payload: { ...(queuedJob.payload ?? {}), fetched, upserted, refreshed } }).eq("id", queuedJob.id);
-    return NextResponse.json({ ok: true, processed: true, jobId: queuedJob.id, fetched, upserted, refreshed });
+    await supabase.from("ingest_job").update({ status: "succeeded", payload: { ...(queuedJob.payload ?? {}), fetched, upserted, parsedOrders, refreshed } }).eq("id", queuedJob.id);
+    return NextResponse.json({ ok: true, processed: true, jobId: queuedJob.id, fetched, upserted, parsedOrders, refreshed });
   } catch (e) {
     const message = e instanceof Error ? e.message : "ingest_process_failed";
     await supabase.from("ingest_job").update({ status: "failed", error: message }).eq("id", queuedJob.id);
