@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { extractHeader, getGmailMessageMetadata, listGmailMessages } from "@/lib/ingest/gmail";
+import { extractHeader, extractHtmlBody, getGmailMessage, listGmailMessages } from "@/lib/ingest/gmail";
 import { getGoogleOAuthConnection, upsertGoogleOAuthConnection } from "@/lib/auth/oauth-connection";
 import { env } from "@/lib/env";
 import { refreshGoogleAccessToken } from "@/lib/auth/google";
@@ -18,16 +18,7 @@ function inferMerchant(fromAddress: string | null) {
 
 export async function POST() {
   const supabase = createSupabaseServerClient();
-  const { data: queuedJob } = await supabase
-    .from("ingest_job")
-    .select("id,payload")
-    .eq("user_id", USER_ID)
-    .eq("job_type", "gmail_fetch")
-    .eq("status", "queued")
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
+  const { data: queuedJob } = await supabase.from("ingest_job").select("id,payload").eq("user_id", USER_ID).eq("job_type", "gmail_fetch").eq("status", "queued").order("created_at", { ascending: true }).limit(1).maybeSingle();
   if (!queuedJob) return NextResponse.json({ ok: true, processed: false, reason: "no_queued_jobs" });
 
   await supabase.from("ingest_job").update({ status: "running" }).eq("id", queuedJob.id).eq("status", "queued");
@@ -56,58 +47,53 @@ export async function POST() {
           const t = await refreshGoogleAccessToken({ refreshToken: conn.refreshToken, clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET });
           accessToken = t.access_token;
           refreshed = true;
-          await upsertGoogleOAuthConnection({ accessToken, refreshToken: conn.refreshToken, expiresAt: t.expires_in ? new Date(Date.now()+t.expires_in*1000).toISOString() : undefined, scope: t.scope || conn.scope });
+          await upsertGoogleOAuthConnection({ accessToken, refreshToken: conn.refreshToken, expiresAt: t.expires_in ? new Date(Date.now() + t.expires_in * 1000).toISOString() : undefined, scope: t.scope || conn.scope });
           page = await listGmailMessages({ accessToken, pageToken, query: queuedJob.payload?.query });
-        } else {
-          throw error;
-        }
+        } else throw error;
       }
 
       const messages = page.messages ?? [];
       fetched += messages.length;
 
       for (const message of messages) {
-        const metadata = await getGmailMessageMetadata({ accessToken, messageId: message.id });
-        const subject = extractHeader(metadata, "subject") ?? null;
-        const fromAddress = extractHeader(metadata, "from") ?? null;
-        const receivedAt = metadata.internalDate ? new Date(Number(metadata.internalDate)).toISOString() : null;
+        const full = await getGmailMessage({ accessToken, messageId: message.id });
+        const subject = extractHeader(full, "subject") ?? null;
+        const fromAddress = extractHeader(full, "from") ?? null;
+        const receivedAt = full.internalDate ? new Date(Number(full.internalDate)).toISOString() : null;
+        const rawHtml = extractHtmlBody(full);
         const merchant = inferMerchant(fromAddress);
 
         const { error } = await supabase.from("source_email").upsert({
           user_id: USER_ID,
-          gmail_message_id: metadata.id,
-          gmail_thread_id: metadata.threadId,
+          gmail_message_id: full.id,
+          gmail_thread_id: full.threadId,
           received_at: receivedAt,
           subject,
           from_address: fromAddress,
+          raw_html: rawHtml,
           parse_status: "pending",
-          raw_html: null,
         }, { onConflict: "user_id,gmail_message_id" });
         if (!error) upserted += 1;
 
-        if (merchant === "knuspr" && subject) {
-          const parsed = parseKnusprEmail(subject);
-          const { data: order, error: orderError } = await supabase
-            .from("order")
-            .insert({
-              user_id: USER_ID,
-              merchant_id: 1,
-              source_email_id: null,
-              order_external_id: parsed.order_external_id,
-              order_date: parsed.order_date,
-              currency: parsed.currency,
-              total_price: parsed.total_price,
-            })
-            .select("id")
-            .single();
-
-          if (!orderError && order) {
-            parsedOrders += 1;
-            await supabase.from("source_email").update({ parse_status: "parsed", parse_error: null }).eq("user_id", USER_ID).eq("gmail_message_id", metadata.id);
+        if (merchant === "knuspr" && rawHtml) {
+          const parsed = parseKnusprEmail(rawHtml);
+          if (parsed.order_external_id) {
+            const { data: existing } = await supabase.from("order").select("id").eq("user_id", USER_ID).eq("merchant_id", 1).eq("order_external_id", parsed.order_external_id).maybeSingle();
+            if (!existing) {
+              const { data: order, error: orderError } = await supabase.from("order").insert({
+                user_id: USER_ID, merchant_id: 1, source_email_id: null, order_external_id: parsed.order_external_id, order_date: parsed.order_date, currency: parsed.currency, total_price: parsed.total_price,
+              }).select("id").single();
+              if (!orderError && order && parsed.items.length > 0) {
+                await supabase.from("order_item").insert(parsed.items.map((i) => ({ order_id: order.id, raw_name: i.raw_name, raw_quantity: i.quantity, raw_unit: i.unit, line_total: i.line_total })));
+              }
+              if (!orderError) parsedOrders += 1;
+            }
+            await supabase.from("source_email").update({ parse_status: "parsed", parse_error: null }).eq("user_id", USER_ID).eq("gmail_message_id", full.id);
+          } else {
+            await supabase.from("source_email").update({ parse_status: "failed", parse_error: "missing_order_external_id" }).eq("user_id", USER_ID).eq("gmail_message_id", full.id);
           }
         }
       }
-
       pageToken = page.nextPageToken;
     } while (pageToken);
 
